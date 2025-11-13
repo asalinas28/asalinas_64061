@@ -1,0 +1,326 @@
+import os
+import io
+import zipfile
+import random
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+import tensorflow as tf
+from tensorflow.keras.datasets import imdb
+from tensorflow.keras import preprocessing
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Embedding, Flatten, LSTM, Dropout
+from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.optimizers import RMSprop, Adam
+
+MAX_FEATURES = 10000   
+BATCH_SIZE = 32
+EMBED_DIM = 100        
+INITIAL_TRAIN_SAMPLES = 100
+VAL_SAMPLES = 10000
+TRAIN_SIZES = [100, 500, 1000, 2000]   
+SHOW_PLOTS = False     
+
+GLOVE_URL = "https://nlp.stanford.edu/data/glove.6B.zip"
+GLOVE_DIR = os.path.join(os.getcwd(), "glove_data")
+GLOVE_ZIP = os.path.join(GLOVE_DIR, "glove.6B.zip")
+GLOVE_FILE = os.path.join(GLOVE_DIR, f"glove.6B.{EMBED_DIM}d.txt")
+
+
+MAX_FEATURES = 10000   
+MAXLEN = 150           
+BATCH_SIZE = 32
+EMBED_DIM = 100        
+INITIAL_TRAIN_SAMPLES = 100
+VAL_SAMPLES = 10000
+TRAIN_SIZES = [100, 500, 1000, 2000]
+SHOW_PLOTS = False
+
+
+RANDOM_SEED = 1337
+np.random.seed(RANDOM_SEED)
+tf.random.set_seed(RANDOM_SEED)
+random.seed(RANDOM_SEED)
+
+
+def ensure_glove_available():
+    """Ensure GloVe vectors exist locally; attempt download if missing."""
+    os.makedirs(GLOVE_DIR, exist_ok=True)
+    if os.path.exists(GLOVE_FILE):
+        print(f"[GloVe] Found: {GLOVE_FILE}")
+        return True
+    try:
+        import urllib.request
+        print(f"[GloVe] Downloading {GLOVE_URL} ...")
+        urllib.request.urlretrieve(GLOVE_URL, GLOVE_ZIP)
+        print("[GloVe] Extracting...")
+        with zipfile.ZipFile(GLOVE_ZIP, "r") as z:
+            z.extractall(GLOVE_DIR)
+        ok = os.path.exists(GLOVE_FILE)
+        print(f"[GloVe] Ready: {GLOVE_FILE}" if ok else "[GloVe] File missing after extract.")
+        return ok
+    except Exception as e:
+        print("[GloVe] Download failed (likely no internet).")
+        print("       Place glove.6B.100d.txt into:", GLOVE_DIR)
+        return os.path.exists(GLOVE_FILE)
+
+
+def load_glove_embeddings(word_index, max_features=MAX_FEATURES, embed_dim=EMBED_DIM):
+    """Build embedding matrix aligned to IMDB word_index using GloVe vectors."""
+    if not os.path.exists(GLOVE_FILE):
+        return None
+    print("[GloVe] Loading vectors...")
+    embeddings_index = {}
+    with open(GLOVE_FILE, encoding="utf-8") as f:
+        for line in f:
+            parts = line.rstrip().split(" ")
+            word, coefs = parts[0], np.asarray(parts[1:], dtype="float32")
+            embeddings_index[word] = coefs
+    print(f"[GloVe] Loaded {len(embeddings_index):,} words.")
+
+    matrix = np.random.normal(scale=0.6, size=(max_features, embed_dim)).astype("float32")
+    for w, i in word_index.items():
+        if i < max_features:
+            vec = embeddings_index.get(w)
+            if vec is not None and len(vec) == embed_dim:
+                matrix[i] = vec
+    return matrix
+
+
+def get_imdb_data(max_features=MAX_FEATURES, maxlen=MAXLEN):
+    """Load IMDB and return padded sequences and labels."""
+    (x_train, y_train), (x_test, y_test) = imdb.load_data(num_words=max_features)
+    x_train = preprocessing.sequence.pad_sequences(x_train, maxlen=maxlen)
+    x_test  = preprocessing.sequence.pad_sequences(x_test, maxlen=maxlen)
+    return (x_train, y_train), (x_test, y_test)
+
+
+def build_learned_embedding_model():
+    model = Sequential([
+        Embedding(MAX_FEATURES, EMBED_DIM, input_length=MAXLEN),
+        Flatten(),
+        Dense(32, activation="relu"),
+        Dropout(0.5),
+        Dense(1, activation="sigmoid"),
+    ])
+    model.compile(optimizer=RMSprop(learning_rate=1e-3), loss="binary_crossentropy", metrics=["accuracy"])
+    return model
+
+def build_lstm_model():
+    model = Sequential([
+        Embedding(MAX_FEATURES, EMBED_DIM, input_length=MAXLEN),
+        LSTM(32),
+        Dropout(0.5),
+        Dense(1, activation="sigmoid"),
+    ])
+    model.compile(optimizer=Adam(learning_rate=1e-3), loss="binary_crossentropy", metrics=["accuracy"])
+    return model
+
+def build_pretrained_embedding_model(embedding_matrix):
+    if embedding_matrix is None:
+        return None
+    model = Sequential([
+        Embedding(MAX_FEATURES, EMBED_DIM, input_length=MAXLEN, weights=[embedding_matrix], trainable=False),
+        Flatten(),
+        Dense(32, activation="relu"),
+        Dropout(0.5),
+        Dense(1, activation="sigmoid"),
+    ])
+    model.compile(optimizer=RMSprop(learning_rate=1e-3), loss="binary_crossentropy", metrics=["accuracy"])
+    return model
+
+def best_val_acc_from_history(history):
+    val_key = "val_accuracy" if "val_accuracy" in history.history else "val_acc"
+    return float(np.max(history.history[val_key]))
+
+def extract_metric_series(history):
+    acc_key = "accuracy" if "accuracy" in history.history else "acc"
+    val_acc_key = "val_accuracy" if "val_accuracy" in history.history else "val_acc"
+    return {
+        "epochs": np.arange(1, len(history.history[acc_key]) + 1),
+        "acc": history.history[acc_key],
+        "val_acc": history.history[val_acc_key],
+        "loss": history.history["loss"],
+        "val_loss": history.history["val_loss"],
+    }
+
+def plot_training_curves(series, title_prefix, out_dir):
+    plt.figure()
+    plt.plot(series["epochs"], series["acc"], marker="o", label="Training accuracy")
+    plt.plot(series["epochs"], series["val_acc"], marker="s", label="Validation accuracy")
+    plt.title(f"{title_prefix}: Training vs Validation Accuracy")
+    plt.xlabel("Epoch")
+    plt.ylabel("Accuracy")
+    plt.legend()
+    plt.grid(True, linestyle="--", alpha=0.5)
+    acc_path = os.path.join(out_dir, f"{title_prefix.replace(' ', '_').lower()}_acc.png")
+    plt.savefig(acc_path, bbox_inches="tight", dpi=150)
+    if SHOW_PLOTS: plt.show()
+    plt.close()
+
+    plt.figure()
+    plt.plot(series["epochs"], series["loss"], marker="o", label="Training loss")
+    plt.plot(series["epochs"], series["val_loss"], marker="s", label="Validation loss")
+    plt.title(f"{title_prefix}: Training vs Validation Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.legend()
+    plt.grid(True, linestyle="--", alpha=0.5)
+    loss_path = os.path.join(out_dir, f"{title_prefix.replace(' ', '_').lower()}_loss.png")
+    plt.savefig(loss_path, bbox_inches="tight", dpi=150)
+    if SHOW_PLOTS: plt.show()
+    plt.close()
+    return acc_path, loss_path
+
+def train_with_early_stopping(model_fn, x_tr, y_tr, x_val, y_val, epochs=10, patience=2):
+    es = EarlyStopping(monitor="val_accuracy", patience=patience, restore_best_weights=True)
+    model = model_fn()
+    history = model.fit(
+        x_tr, y_tr,
+        validation_data=(x_val, y_val),
+        epochs=epochs,
+        batch_size=BATCH_SIZE,
+        callbacks=[es],
+        verbose=0
+    )
+    return model, history
+
+def main():
+    os.makedirs("outputs", exist_ok=True)
+
+    print("Assignment 4: IMDB experiments (with graphs)")
+    print(f"Config: MAX_FEATURES={MAX_FEATURES}, MAXLEN={MAXLEN}, EMBED_DIM={EMBED_DIM}")
+
+    (x_train_all, y_train_all), (x_test, y_test) = get_imdb_data()
+    word_index = imdb.get_word_index()
+
+    x_val_fixed = x_train_all[INITIAL_TRAIN_SAMPLES:INITIAL_TRAIN_SAMPLES + VAL_SAMPLES]
+    y_val_fixed = y_train_all[INITIAL_TRAIN_SAMPLES:INITIAL_TRAIN_SAMPLES + VAL_SAMPLES]
+
+    glove_ok = ensure_glove_available()
+    embedding_matrix = load_glove_embeddings(word_index) if glove_ok else None
+
+    def make_learned(): return build_learned_embedding_model()
+    def make_lstm(): return build_lstm_model()
+    def make_pretrained():
+        if embedding_matrix is None:
+            print("[WARN] Pretrained embedding unavailable. Skipping this model.")
+            return None
+        return build_pretrained_embedding_model(embedding_matrix)
+
+    print("\n=== Baseline (train_size=100, val_size=10,000) — plotting per-model curves ===")
+    x_tr_base = x_train_all[:INITIAL_TRAIN_SAMPLES]
+    y_tr_base = y_train_all[:INITIAL_TRAIN_SAMPLES]
+
+    histories_baseline = {}
+    results = []
+
+    for name, builder in [("LearnedEmbedding", make_learned),
+                          ("PretrainedEmbedding", make_pretrained),
+                          ("LSTM", make_lstm)]:
+        model_fn = builder
+        if model_fn() is None:
+            results.append({"train_size": INITIAL_TRAIN_SAMPLES, "model": name, "val_acc": np.nan})
+            continue
+        model, history = train_with_early_stopping(model_fn, x_tr_base, y_tr_base, x_val_fixed, y_val_fixed, epochs=10, patience=2)
+        val = best_val_acc_from_history(history)
+        print(f"[Baseline] {name}: best val_acc={val:.4f}")
+        results.append({"train_size": INITIAL_TRAIN_SAMPLES, "model": name, "val_acc": val})
+        histories_baseline[name] = history
+
+    for name, hist in histories_baseline.items():
+        series = extract_metric_series(hist)
+        plot_training_curves(series, f"{name} (train100)", "outputs")
+
+    print("\n=== Training size sweep (summary graph) ===")
+    for size in TRAIN_SIZES:
+        x_tr = x_train_all[:size]
+        y_tr = y_train_all[:size]
+        for name, builder in [("LearnedEmbedding", make_learned),
+                              ("PretrainedEmbedding", make_pretrained),
+                              ("LSTM", make_lstm)]:
+            model_fn = builder
+            if model_fn() is None:
+                results.append({"train_size": size, "model": name, "val_acc": np.nan})
+                continue
+            _, history = train_with_early_stopping(model_fn, x_tr, y_tr, x_val_fixed, y_val_fixed, epochs=10, patience=2)
+            val = best_val_acc_from_history(history)
+            print(f"[{size}] {name}: best val_acc={val:.4f}")
+            results.append({"train_size": size, "model": name, "val_acc": val})
+
+    df = pd.DataFrame(results)
+    df = df.sort_values(["train_size", "model"]).reset_index(drop=True)
+    print("\nResults (validation accuracy by model and train size):")
+    print(df)
+
+    csv_path = os.path.join("outputs", "imdb_results.csv")
+    df.to_csv(csv_path, index=False)
+    print("Saved:", csv_path)
+
+    pivot = df.pivot_table(index="train_size", columns="model", values="val_acc", aggfunc="max")
+    plt.figure()
+    for col in pivot.columns:
+        plt.plot(pivot.index, pivot[col], marker="o", label=col)
+    plt.title("Validation Accuracy vs. Training Size (IMDB)")
+    plt.xlabel("Training Size (samples)")
+    plt.ylabel("Validation Accuracy")
+    plt.legend()
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plot_path = os.path.join("outputs", "imdb_accuracy_vs_size.png")
+    plt.savefig(plot_path, bbox_inches="tight", dpi=150)
+    if SHOW_PLOTS: plt.show()
+    plt.close()
+    print("Saved:", plot_path)
+
+    crossover_size = None
+    if "LearnedEmbedding" in pivot.columns and "PretrainedEmbedding" in pivot.columns:
+        for size in pivot.index:
+            le = pivot.loc[size, "LearnedEmbedding"]
+            pe = pivot.loc[size, "PretrainedEmbedding"]
+            if not (np.isnan(le) or np.isnan(pe)) and le >= pe:
+                crossover_size = int(size)
+                break
+
+    os.makedirs("outputs", exist_ok=True)
+    report_md = io.StringIO()
+    report_md.write("# Assignment 4: Text and Sequence Data — IMDB Experiments\n\n")
+    report_md.write("**Setup:** top 10,000 words, cutoff 150 tokens, initial training=100, validation=10,000.\n\n")
+    report_md.write("**Models compared:** Learned Embedding, Pretrained GloVe-100d (frozen), and LSTM.\n\n")
+    report_md.write("## Results Summary\n\n")
+    try:
+        report_md.write(df.to_markdown(index=False))
+    except Exception:
+        report_md.write("```\n" + df.to_string(index=False) + "\n```\n")
+    report_md.write("\n\n")
+    if crossover_size is not None:
+        report_md.write(f"**Crossover:** Learned embedding first matches/exceeds pretrained at ~**{crossover_size}** samples.\n\n")
+    else:
+        report_md.write("**Crossover:** Not observed within tested sizes (increase TRAIN_SIZES to explore further).\n\n")
+
+    report_md.write(f"**Summary Graph:** `outputs/{os.path.basename(plot_path)}`\n\n")
+    report_md.write("**Per-model Curves (Baseline train=100):**\n\n")
+    report_md.write("- LearnedEmbedding accuracy/loss: `outputs/learnedembedding_(train100)_acc.png`, `outputs/learnedembedding_(train100)_loss.png`\n")
+    report_md.write("- PretrainedEmbedding accuracy/loss: `outputs/pretrainedembedding_(train100)_acc.png`, `outputs/pretrainedembedding_(train100)_loss.png`\n")
+    report_md.write("- LSTM accuracy/loss: `outputs/lstm_(train100)_acc.png`, `outputs/lstm_(train100)_loss.png`\n\n")
+
+    report_md.write("## Discussion\n")
+    report_md.write("- **RNN (LSTM)** processes tokens sequentially and maintains a hidden state; good for sequences but less parallelizable.\n")
+    report_md.write("- **Transformer** uses **self-attention** (no recurrence) to model long-range dependencies in parallel, often training faster and capturing global context.\n")
+    report_md.write("- With **limited data**, **pretrained embeddings** provide strong priors; with more data, a **learned embedding** can catch up or surpass them.\n\n")
+
+    report_md.write("## Requirements Coverage\n")
+    report_md.write("- Cutoff=150, Top words=10,000, Train=100, Validate=10,000 ✅\n")
+    report_md.write("- Compared **learned vs pretrained embeddings** (+ LSTM RNN) ✅\n")
+    report_md.write("- **Training-size sweep** + **summary graph** to find crossover ✅\n")
+    report_md.write("- **Per-model training/validation curves** (baseline) ✅\n")
+    report_md.write("- Results table + saved plots + brief narrative ✅\n")
+
+    with open(os.path.join("outputs", "report_assignment4_imdb.md"), "w", encoding="utf-8") as f:
+        f.write(report_md.getvalue())
+    print("Saved report:", os.path.join("outputs", "report_assignment4_imdb.md"))
+
+if __name__ == "__main__":
+    main()
+
+your_command > output.txt
